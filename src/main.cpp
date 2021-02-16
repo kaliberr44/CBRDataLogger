@@ -12,15 +12,14 @@ const uint8_t MSG_BYTE_LENGTH_DATA = 16;
 const uint8_t RESPONSE_BUFFER_SIZE = 20;
 const uint32_t SERIAL_DEBUG_BAUD_RATE = 115200;
 const uint16_t SERIAL_KLINE_BAUD_RATE = 10400;
-const uint16_t TIMEOUT_MS = 1000;
+const uint16_t TIMEOUT_BETWEN_BYTES_MS = 20; // K-Line specs allow up to 20 ms between next bytes in response 
 const uint8_t REFRESH_SPEED_HZ = 10;
 const uint8_t DELAY_AFTER_SEND_MS = 1000 / REFRESH_SPEED_HZ;
 
-#define SERIAL_DEBUG Serial  //Serial USB for monitor
-#define SERIAL_KLINE Serial1 //Hardware serial for K-Line
-#define TX_PIN SERIAL1_TX    // K-Line input
-#define RX_PIN SERIAL1_RX    // K-Line output
-#define BOARD_LED PIN_LED    // Board in build LED
+#define SERIAL_DEBUG Serial     // Serial USB for monitor
+#define SERIAL_KLINE Serial1    // Hardware serial for K-Line
+#define K_LINE_PIN SERIAL1_TX   // K-Line input
+#define BOARD_LED PIN_LED       // Board in build LED
 
 #pragma pack(push)
 #pragma pack(4)
@@ -28,7 +27,7 @@ typedef struct
 {
     uint32_t id = 200;         // little endian PID
     uint16_t rpm = 0;          // bytesToUintLe(raw,0,2)
-    uint8_t tps = 0;           // bytesToUint(raw,2,1) * 5 / 256
+    uint8_t tps = 0;           // bytesToUint(raw,2,1) / 2
     uint8_t batt = 0x7A;       // bytesToUint(raw,3,1) / 10
     uint8_t nceg = 0b00001000; // Gear = bitsToUint(raw,37,3), Neutral/Clutch = bitsToUint(raw,36,1), Engine On = bitsToUint(raw,35,1)
     uint8_t dataB06 = 0;
@@ -45,6 +44,11 @@ typedef struct
 } RaceChronoMsg;
 #pragma pack(pop)
 
+typedef struct
+{
+    uint8_t speed = 0;
+} NonRaceChronoPacket;
+
 // Bluetooth settings
 BLEService dataLoggerService = BLEService(BLE_SERVICE_UUID);
 BLECharacteristic canBusMainCharacteristic = BLECharacteristic(BLE_CHARACTERISTIC_MAIN_UUID, BLENotify | BLERead, MSG_BYTE_LENGTH_PID + MSG_BYTE_LENGTH_DATA, true);
@@ -53,6 +57,7 @@ BLECharacteristic canBusFilterCharacteristic = BLECharacteristic(BLE_CHARACTERIS
 // Diffrent connection states
 enum ECUConnectionState
 {
+    DEBUG_MODE,
     UNKNOWN,
     KLINE_STATE_SET,
     INITIALIZED
@@ -62,6 +67,7 @@ ECUConnectionState ECUConnection = UNKNOWN;
 
 uint8_t ECUInitMsgPart1[] = {0xFE, 0x04, 0xFF, 0xFF};
 // ECU: NO RESPONSE
+// Wait 50 ms
 uint8_t ECUInitMsgPart2[] = {0x72, 0x05, 0x00, 0xF0, 0x99};
 // ECU: 0x02 ,0x04, 0x00, 0xFA
 uint8_t ECUInitResponse[] = {0x02, 0x04, 0x00, 0xFA};
@@ -81,13 +87,17 @@ uint8_t ECURequestMsgDataTableD1[] = {0x72, 0x07, 0x72, 0xD1, 0x00, 0x05, 0x3F};
 // ECUL CMD,  LEN,  QUR,  TABN, STR,  NEUT, ????, ????, ????, ENG,  CHK
 // ECU: 0x02, 0x0B, 0x72, 0xD1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xAF
 
-uint8_t GearRatios[] = {125, 91, 76, 66, 59, 55};
-uint8_t Response[RESPONSE_BUFFER_SIZE]; // Buffer for response from ECU
-RaceChronoMsg RaceChronoDataMsg;        // Last RC data message if we get no or bad response data from ECU
-uint8_t lastGear = 0;                   // Last gear value for when downshifting with clutch pulled in
+// 
+uint8_t GearRatios[] = {125, 91, 76, 66, 59, 55};   // RPM/SPD Calculated from https://www.gearingcommander.com/ - latter on we will use real values
+uint8_t Response[RESPONSE_BUFFER_SIZE];             // Buffer for response from ECU
+RaceChronoMsg RaceChronoDataMsg;                    // Last RC data message if we get no or bad response data from ECU
+NonRaceChronoPacket NonRaceChronoDataPacket;        // Last RC data message if we get no or bad response data from ECU
+uint8_t lastGear = 0;                               // Last gear value for when downshifting with clutch pulled in
 
 void debugByteData(char const *msg, uint8_t *byteBuffer, uint8_t bufferLen);
 void debugSingleByte(uint8_t singleByte);
+
+void debugMode();
 
 void startSerialDebug();
 
@@ -95,16 +105,19 @@ void startSerialKLine();
 void ecuInitBusAndTransceiver();
 bool ecuSendInitSequence();
 void ecuSendData(uint8_t *byteBuffer, uint8_t bufferLen);
-uint8_t ecuGetResponse(uint8_t *response);
+uint8_t ecuGetResponse(uint8_t *response, uint8_t expectedRespLen);
 bool ecuGetDataTable(uint8_t *tableMsg, uint8_t tableMsgLen);
 bool checkChecksum(uint8_t checksum, uint8_t *data, uint8_t dataLength);
+bool ecuGetDataAndFillPacket();
 
 uint8_t calculateGear(uint16_t rpm, uint8_t speed, bool clutchOrNeutral);
+void sensorCreateLatestPacket(uint8_t rpmh, uint8_t rpml, uint8_t speed, uint8_t tps, uint8_t batt, uint8_t nck, uint8_t eng);
 
 void startBLE();
 void setupBLE();
+bool bleDeviceConnected();
+void notifyBluetoothCharacteristics();
 void bleFilterCharacteristicCallback(BLEDevice central, BLECharacteristic characteristic);
-void sensorNotifyLatestPacket(uint8_t rpmh, uint8_t rpml, uint8_t tps, uint8_t batt, uint8_t nck, uint8_t eng);
 
 void startIMU();
 
@@ -116,7 +129,8 @@ void startSerialDebug()
 }
 
 void startSerialKLine()
-{
+{   
+    digitalWrite(K_LINE_PIN, HIGH);
     SERIAL_KLINE.begin(SERIAL_KLINE_BAUD_RATE);
     while (!SERIAL_KLINE)
         ;
@@ -164,6 +178,52 @@ void debugSingleByte(uint8_t singleByte)
         SERIAL_DEBUG.print("0"); // add leading 0 for single digit bytes
     }
     SERIAL_DEBUG.print(singleByte, HEX);
+}
+
+void debugMode()
+{
+    if(SERIAL_DEBUG.available())
+    {   
+        uint8_t input = SERIAL_DEBUG.read();
+        switch (input)
+        {
+        case 'l':
+            ECUConnection = DEBUG_MODE;
+            digitalWrite(K_LINE_PIN, LOW);
+            break;
+        case 'h':
+            ECUConnection = DEBUG_MODE;
+            digitalWrite(K_LINE_PIN, HIGH);
+            break;
+        case 'i':
+            ECUConnection = DEBUG_MODE;
+            ecuInitBusAndTransceiver();
+            ecuSendInitSequence();
+            break;
+        case 'g':
+            ECUConnection = DEBUG_MODE;
+            ecuGetDataAndFillPacket();
+            break;
+        case 'b':
+            ECUConnection = DEBUG_MODE;
+            notifyBluetoothCharacteristics();
+            break;
+        case 'a':
+            ECUConnection = DEBUG_MODE;
+            ecuInitBusAndTransceiver();
+            if(ecuSendInitSequence() && ecuGetDataAndFillPacket())
+            {
+                notifyBluetoothCharacteristics();
+            }
+            break;
+        case 'n':
+            ECUConnection = UNKNOWN;
+            break;
+        default:
+            ECUConnection = DEBUG_MODE;
+            break;
+        }
+    }
 }
 
 void setupBLE()
@@ -222,11 +282,11 @@ void ecuInitBusAndTransceiver()
     SERIAL_DEBUG.println("K-Line Serial disabled");
     delay(350);
 
-    digitalWrite(TX_PIN, LOW);
+    digitalWrite(K_LINE_PIN, LOW);
     delay(70);
-    digitalWrite(TX_PIN, HIGH);
+    digitalWrite(K_LINE_PIN, HIGH);
     delay(120);
-    pinMode(TX_PIN, OUTPUT);
+    // pinMode(K_LINE_PIN, OUTPUT);
     SERIAL_DEBUG.println("K-Line state LOW(70) -> HIGH(120) change done");
 
     SERIAL_KLINE.begin(SERIAL_KLINE_BAUD_RATE);
@@ -241,13 +301,14 @@ bool ecuSendInitSequence()
     SERIAL_DEBUG.println("Sending init sequence");
     SERIAL_DEBUG.println("Sending first part of init message sent");
     ecuSendData(ECUInitMsgPart1, sizeof(ECUInitMsgPart1));
-    ecuGetResponse(Response);
-
+    // No response
+    SERIAL_DEBUG.println("Waiting 50 ms");
+    delay(50);
     SERIAL_DEBUG.println("Sending second part init message sent");
     ecuSendData(ECUInitMsgPart2, sizeof(ECUInitMsgPart2));
-    uint8_t responseLen = ecuGetResponse(Response);
+    uint8_t responseLen = ecuGetResponse(Response, sizeof(ECUInitResponse));
 
-    if (responseLen == sizeof(ECUInitResponse) && checkChecksum(ECUInitResponse[sizeof(ECUInitResponse) - 1], Response, responseLen))
+    if (responseLen == sizeof(ECUInitResponse) && Response[0] == 0x02 && checkChecksum(ECUInitResponse[sizeof(ECUInitResponse) - 1], Response, responseLen))
     {
         SERIAL_DEBUG.println("Init succeeded");
         return true;
@@ -295,28 +356,40 @@ void ecuSendData(uint8_t *byteBuffer, uint8_t bufferLen)
     SERIAL_DEBUG.print(" END");
 }
 
-uint8_t ecuGetResponse(uint8_t *response)
+uint8_t ecuGetResponse(uint8_t *response, uint8_t expectedRespLen)
 {
     memset(response, 0, RESPONSE_BUFFER_SIZE);
+
     ulong waitTimeMs = millis();
-    while (!SERIAL_KLINE.available() && (millis() - waitTimeMs < DELAY_AFTER_SEND_MS))
+    uint8_t index = 0;
+    //Initial delay after send for ECU to respond
+    while (millis() - waitTimeMs > DELAY_AFTER_SEND_MS)
     {
+        delay(1);
+    }
+
+    while (index < expectedRespLen && (millis() - waitTimeMs < TIMEOUT_BETWEN_BYTES_MS))
+    {
+        if(SERIAL_KLINE.available())
+        {
+            uint8_t dataByte = SERIAL_KLINE.read();
+
+            if(index < RESPONSE_BUFFER_SIZE)
+            {
+                response[index] = dataByte;
+            }
+            
+            index++;
+        }
         waitTimeMs = millis();
     }
 
-    uint8_t index = 0;
-    while (SERIAL_KLINE.available() && index < RESPONSE_BUFFER_SIZE)
-    {
-        uint8_t dataByte = SERIAL_KLINE.read();
 
-        response[index] = dataByte;
+    uint8_t responseLength = (index < RESPONSE_BUFFER_SIZE) ? index : RESPONSE_BUFFER_SIZE;
 
-        index++;
-    }
+    debugByteData("Response data", response, responseLength);
 
-    debugByteData("Response data", response, index);
-
-    return index;
+    return responseLength;
 }
 
 bool ecuGetDataTable(uint8_t *tableMsg, uint8_t tableMsgLen)
@@ -328,7 +401,7 @@ bool ecuGetDataTable(uint8_t *tableMsg, uint8_t tableMsgLen)
     uint8_t expectedLen = tableMsg[5] - tableMsg[4] + 6;
 
     ecuSendData(tableMsg, tableMsgLen);
-    uint8_t responseLen = ecuGetResponse(Response);
+    uint8_t responseLen = ecuGetResponse(Response, expectedLen);
 
     if (responseLen == expectedLen && checkChecksum(Response[responseLen - 1], Response, responseLen))
     {
@@ -339,12 +412,46 @@ bool ecuGetDataTable(uint8_t *tableMsg, uint8_t tableMsgLen)
     SERIAL_DEBUG.println("Getting data table failed!");
     SERIAL_DEBUG.println("Response size: ");
     SERIAL_DEBUG.print(responseLen);
-    if (responseLen > 0)
+    if (responseLen == expectedLen)
     {
         SERIAL_DEBUG.print(". Response checksum: ");
         SERIAL_DEBUG.print(Response[responseLen - 1]);
     }
     return false;
+}
+
+bool ecuGetDataAndFillPacket()
+{
+    uint8_t rpmh = (RaceChronoDataMsg.rpm & 0xFF00) >> 8; 
+    uint8_t rpml = RaceChronoDataMsg.rpm & 0x00FF;
+    uint8_t speed = NonRaceChronoDataPacket.speed;
+    uint8_t tps = RaceChronoDataMsg.tps;
+    uint8_t batt = RaceChronoDataMsg.batt;
+    uint8_t nck = RaceChronoDataMsg.nceg & 0b00001000;
+    uint8_t eng = RaceChronoDataMsg.nceg & 0b00010000;
+
+    if(ecuGetDataTable(ECURequestMsgDataTableD1, sizeof(ECURequestMsgDataTableD1)))
+    {
+        nck = Response[5];
+        eng = Response[9];
+
+        sensorCreateLatestPacket(rpmh, rpml, speed, tps, batt, nck, eng);
+    }
+    else
+    {
+        return false;
+    }
+
+    if(ecuGetDataTable(ECURequestMsgDataTable11, sizeof(ECURequestMsgDataTable11)))
+    {
+        sensorCreateLatestPacket(Response[5], Response[6], Response[18], Response[8], Response[17], nck, eng);
+    }
+    else
+    {
+        return false;
+    }
+    
+    return true;
 }
 
 bool checkChecksum(uint8_t checksum, uint8_t *data, uint8_t dataLength)
@@ -360,11 +467,12 @@ bool checkChecksum(uint8_t checksum, uint8_t *data, uint8_t dataLength)
     return checksum == calculatedChecksum;
 }
 
-void sensorNotifyLatestPacket(uint8_t rpmh, uint8_t rpml, uint8_t speed, uint8_t tps, uint8_t batt, uint8_t nck, uint8_t eng)
+void sensorCreateLatestPacket(uint8_t rpmh, uint8_t rpml, uint8_t speed, uint8_t tps, uint8_t batt, uint8_t nck, uint8_t eng)
 {
     uint16_t rpm = (uint16_t)(rpmh << 8) | rpml;
     uint8_t gear = (eng) ? calculateGear(rpm, speed, nck) : 0;
 
+    NonRaceChronoDataPacket.speed = speed;
 
     RaceChronoDataMsg.rpm = rpm;
     RaceChronoDataMsg.tps = tps;
@@ -385,9 +493,31 @@ void sensorNotifyLatestPacket(uint8_t rpmh, uint8_t rpml, uint8_t speed, uint8_t
     SERIAL_DEBUG.print(" ENGINE = ");
     SERIAL_DEBUG.print((eng) ? "ON" : "OFF");
 
+}
 
-    // Notify
-    canBusMainCharacteristic.writeValue((uint8_t *)&RaceChronoDataMsg, sizeof(RaceChronoDataMsg));
+bool bleDeviceConnected()
+{
+    BLEDevice raceChronoAndroidApp = BLE.central();
+    if(raceChronoAndroidApp && raceChronoAndroidApp.connected())
+    {
+        digitalWrite(BOARD_LED, HIGH);
+        return true;
+    }
+    else
+    {
+        digitalWrite(BOARD_LED, LOW);
+        SERIAL_DEBUG.println("BLE device not connected!");
+        return false;
+    }
+}
+
+void notifyBluetoothCharacteristics()
+{
+    if(bleDeviceConnected())
+    {
+        SERIAL_DEBUG.println("Data sent to BLE device");
+        canBusMainCharacteristic.writeValue((uint8_t *)&RaceChronoDataMsg, sizeof(RaceChronoDataMsg));
+    }
 }
 
 uint8_t calculateGear(uint16_t rpm, uint8_t speed, bool clutchOrNeutral)
@@ -413,10 +543,12 @@ uint8_t calculateGear(uint16_t rpm, uint8_t speed, bool clutchOrNeutral)
         uint8_t delta = abs(GearRatios[i] - currentRatio);
         if (delta > lastRatioDelta)
         {
+            lastGear = i;
             return i;
         }
         lastRatioDelta = delta;
     }
+    lastGear = maxGear;
     return maxGear;
 }
 
@@ -434,6 +566,8 @@ void setup()
 
 void loop()
 {
+    debugMode();
+
     if (ECUConnection == UNKNOWN)
     {
         ecuInitBusAndTransceiver();
@@ -445,6 +579,8 @@ void loop()
     }
     if (ECUConnection == INITIALIZED)
     {
-        ECUConnection = (ecuGetDataTable(ECURequestMsgDataTable11, sizeof(ECURequestMsgDataTable11))) ? INITIALIZED : UNKNOWN;
+        ECUConnection = (ecuGetDataAndFillPacket()) ? INITIALIZED : UNKNOWN;
+
+        notifyBluetoothCharacteristics();
     }
 }
