@@ -27,7 +27,7 @@ typedef struct
 {
     uint32_t id = 200;         // little endian PID
     uint16_t rpm = 0;          // bytesToUintLe(raw,0,2)
-    uint8_t tps = 0;           // bytesToUint(raw,2,1) / 2
+    uint8_t tps = 0;           // bytesToUint(raw,2,1) / 1.6
     uint8_t batt = 0x7A;       // bytesToUint(raw,3,1) / 10
     uint8_t nceg = 0b00001000; // Gear = bitsToUint(raw,37,3), Neutral/Clutch = bitsToUint(raw,36,1), Engine On = bitsToUint(raw,35,1)
     uint8_t dataB06 = 0;
