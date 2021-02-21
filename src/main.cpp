@@ -197,6 +197,7 @@ void debugMode()
             case 'd':
                 ECUConnection = DEBUG_MODE;
                 SERIAL_DEBUG.println("Debug mode ON");
+                break;
             case 'l':
                 ECUConnection = DEBUG_MODE;
                 SERIAL_KLINE.end();
@@ -234,7 +235,7 @@ void debugMode()
             default:
                 ECUConnection = DEBUG_MODE;
                 SERIAL_DEBUG.println("Unknown debug command");
-            break;
+                break;
         }
     }
 }
