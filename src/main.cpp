@@ -57,8 +57,8 @@ typedef struct
     uint8_t tps = 0;           // bytesToUint(raw,2,1) / 1.6
     uint8_t batt = 0x7A;       // bytesToUint(raw,3,1) / 10
     uint8_t nceg = 0b00001000; // Gear = bitsToUint(raw,37,3), Neutral/Clutch = bitsToUint(raw,36,1), Engine On = bitsToUint(raw,35,1)
-    uint8_t dataB06 = 0;
-    uint8_t dataB07 = 0;
+    uint8_t ratio = 0;         // bytesToUint(raw,5,1)
+    uint8_t speed = 0;         // bytesToUint(raw,6,1)
     uint8_t dataB08 = 0;
     uint8_t dataB09 = 0;
     uint8_t dataB10 = 0;
@@ -98,11 +98,10 @@ uint8_t ECUWakeUpMsg[] = {0xFE, 0x04, 0x72, 0x8C};
 uint8_t ECUWakeUpResponse[] = {0x0E, 0x04, 0x72, 0x7C};
 
 
-/* maybe not necessary - test
 uint8_t ECUInitMsg[] = {0x72, 0x05, 0x00, 0xF0, 0x99};
 // ECU: 0x02 ,0x04, 0x00, 0xFA
 uint8_t ECUInitResponse[] = {0x02, 0x04, 0x00, 0xFA};
-*/
+
 
 uint8_t ECURequestMsgDataTable11[] = {0x72, 0x07, 0x72, 0x11, 0x00, 0x0E, 0xF6};
 // Get as far as Speed - ignore rest of memory bank
@@ -146,6 +145,7 @@ bool ecuSendInitSequence();
 bool ecuGetDataAndFillPacket();
 bool ecuGetDataTable(uint8_t *tableMsg, uint8_t tableMsgLen);
 uint8_t calculateGear(uint16_t rpm, uint8_t speed, bool clutchOrNeutral);
+uint8_t calculateGearRatio(uint16_t rpm, uint8_t speed);
 void sensorCreateLatestPacket(uint8_t rpmh, uint8_t rpml, uint8_t speed, uint8_t tps, uint8_t batt, uint8_t nck, uint8_t eng);
 
 // BLE
@@ -408,16 +408,17 @@ bool ecuSendInitSequence()
     ecuSendData(ECUWakeUpMsg, sizeof(ECUWakeUpMsg));
     uint8_t responseLen = ecuGetResponse(Response, sizeof(ECUWakeUpResponse));
 
-    return validateResponse("Init failed!        ", ECUWakeUpResponse[0], Response, responseLen, sizeof(ECUWakeUpResponse));
-    /*
-    SERIAL_DEBUG.println("Waiting 50 ms");
-    delay(50);
+    if(!validateResponse("Wake up failed!     ", ECUWakeUpResponse[0], Response, responseLen, sizeof(ECUWakeUpResponse)))
+    {
+        return false;
+    }
+    
     SERIAL_DEBUG.println("Sending init message");
     ecuSendData(ECUInitMsg, sizeof(ECUInitMsg));
-    uint8_t responseLen = ecuGetResponse(Response, sizeof(ECUInitResponse));
+    responseLen = ecuGetResponse(Response, sizeof(ECUInitResponse));
 
-    return validateResponse("Init failed!        ", 0x02, Response, responseLen, sizeof(ECUInitResponse));
-    */
+    return validateResponse("Init message failed!", ECUInitResponse[0], Response, responseLen, sizeof(ECUInitResponse));
+    
 }
 
 bool ecuGetDataAndFillPacket()
@@ -453,6 +454,7 @@ bool ecuGetDataTable(uint8_t *tableMsg, uint8_t tableMsgLen)
 {
     SERIAL_DEBUG.print("Sending request for data table: ");
     debugSingleByte(tableMsg[3]);
+    SERIAL_DEBUG.println();
 
     // Expected data length = actual data length (end register - start register) + cmd + len + qur + tabn + str + chk (6 const msg bytes)
     uint8_t expectedLen = tableMsg[5] - tableMsg[4] + 6;
@@ -498,31 +500,50 @@ uint8_t calculateGear(uint16_t rpm, uint8_t speed, bool clutchOrNeutral)
     return maxGear;
 }
 
+uint8_t calculateGearRatio(uint16_t rpm, uint8_t speed)
+{
+    if(rpm == 0 || speed == 0)
+    {
+        return 0;
+    }
+    
+    return rpm / speed;
+
+}
+
 void sensorCreateLatestPacket(uint8_t rpmh, uint8_t rpml, uint8_t speed, uint8_t tps, uint8_t batt, uint8_t nck, uint8_t eng)
 {
     uint16_t rpm = (uint16_t)(rpmh << 8) | rpml;
     uint8_t gear = (eng) ? calculateGear(rpm, speed, nck) : 0;
+    uint8_t gearRatio = (eng) ? calculateGearRatio(rpm, speed) : 0;
 
     NonRaceChronoDataPacket.speed = speed;
 
     RaceChronoDataMsg.rpm = rpm;
     RaceChronoDataMsg.tps = tps;
     RaceChronoDataMsg.batt = batt;
-    RaceChronoDataMsg.nceg = eng << 4 | (nck & 0x01 << 3) | gear;
+    RaceChronoDataMsg.nceg = eng << 4 | ((nck & 0x01) << 3) | gear;
+    RaceChronoDataMsg.ratio = gearRatio; 
+    RaceChronoDataMsg.speed = speed; 
 
-    SERIAL_DEBUG.println("Real values:");
-    SERIAL_DEBUG.print("RPM = ");
+    SERIAL_DEBUG.print("Real values:");
+    SERIAL_DEBUG.print(" RPM = ");
     SERIAL_DEBUG.print(rpm);
-    SERIAL_DEBUG.print(" TPS% = ");
-    SERIAL_DEBUG.print(tps / 1.6);
-    SERIAL_DEBUG.print(" BATT[V] = ");
-    SERIAL_DEBUG.print((float)batt / 10);
+    SERIAL_DEBUG.print(" SPEED = ");
+    SERIAL_DEBUG.print(gearRatio);
+    SERIAL_DEBUG.print(" RATIO = ");
+    SERIAL_DEBUG.print(gearRatio);
     SERIAL_DEBUG.print(" GEAR = ");
     SERIAL_DEBUG.print(gear);
     SERIAL_DEBUG.print(" NEUTRAL/CLUTCH = ");
-    SERIAL_DEBUG.print((nck & 0x01) ? "ON" : "OFF");
+    SERIAL_DEBUG.print((nck & 0x01) ? "ON " : "OFF");
     SERIAL_DEBUG.print(" ENGINE = ");
-    SERIAL_DEBUG.println((eng) ? "ON" : "OFF");
+    SERIAL_DEBUG.print((eng) ? "ON " : "OFF");
+    SERIAL_DEBUG.print(" BATT[V] = ");
+    SERIAL_DEBUG.print((float)batt / 10);
+    SERIAL_DEBUG.print(" TPS% = ");
+    SERIAL_DEBUG.print(tps / 1.6);
+    SERIAL_DEBUG.println();
 }
 
 
